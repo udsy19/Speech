@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from io import TextIOWrapper
 from pathlib import Path
-from typing import Optional, Self
+from typing import Callable, Optional, Self
 
 import numpy as np
 import soundfile as sf
@@ -81,30 +81,28 @@ class _DefaultParams:
     distillation_cfg_scale: float = 2.5
     # Temperature used for softening logits during distillation (1.0 means no change).
     distillation_temperature: float = 1.0
-    # Weight coefficient in the combined entropy-divergence distillation loss.
-    audio_alpha: float = 0.3
+    # Weight coefficient of the KLD distillation loss.
+    audio_kl_loss_weight: float = 0.1
+    # Weight coefficient of the cross-entropy distillation loss.
+    audio_ce_loss_weight: float = 0.3
     # Weight coefficient for the NRMSE component in the distillation loss.
-    audio_beta: float = 1.0
+    audio_nrmse_loss_weight: float = 2.0
     # Fraction of the ground-truth sequence length used for finalized rollout rejection.
     lower_rejection_threshold: Optional[float] = 0.5
     # Fraction of the ground-truth sequence length used as a cutoff for early rollout truncation.
-    upper_rejection_threshold: Optional[float] = 2.0
+    upper_rejection_threshold: Optional[float] = 1.5
     # Weight assigned to truncated samples when computing the loss (used to down-weight rejected rollouts).
-    rejection_weight: Optional[float] = 0.1
+    rejection_weight: Optional[float] = 0.01
     # Whether to enable distillation of the local transformer head in addition to the main decoder logits.
     distill_local_transformer: bool = True
     # Target mixing weight for the local-transformer distillation loss in the final total loss.
-    lt_loss_weight: float = 0.1
+    lt_loss_weight: float = 0.2
     # Global training step at which local-transformer distillation becomes active.
-    lt_distillation_start_step: int = 2000
+    lt_distillation_start_step: int = 500
     # Number of steps used to linearly ramp the local-transformer loss weight from 0 to `lt_loss_weight`.
     lt_distillation_ramp_len: int = 2000
-    # Whether to enable phoneme-channel supervision or distillation during training.
-    distill_phoneme_channel: bool = False
     # Weight coefficient for the phoneme-channel loss contribution in the final total loss.
-    phonemes_loss_weight: float = 0.01
-    # Weight coefficient controlling the balance between KL-divergence and cross-entropy for phoneme distillation.
-    phonemes_distillation_alpha: float = 0.3
+    phoneme_ce_loss_weight: float = 0.01
     # Whether to save rejected teacher rollouts for debugging.
     use_rejection_debug_mode: bool = False
 
@@ -119,38 +117,35 @@ def _validate_configuration(cfg: DictConfig) -> None:
             "Typical values for distillation are in the range [1.0, 4.0]."
         )
 
-    if hasattr(cfg, "audio_alpha") and not (0 <= cfg.get("audio_alpha") <= 1):
-        raise ValueError(
-            "`audio_alpha` must be in the range [0, 1]. "
-            "It controls the weighting between KL-divergence and cross-entropy losses."
-        )
+    if hasattr(cfg, "audio_kl_loss_weight") and cfg.get("audio_kl_loss_weight") < 0:
+        raise ValueError("`audio_kl_loss_weight` must be non-negative.")
 
-    if hasattr(cfg, "audio_beta") and cfg.get("audio_beta") < 0:
-        raise ValueError("`audio_beta` must be non-negative. It scales the contribution of the NRMSE loss component.")
+    if hasattr(cfg, "audio_ce_loss_weight") and cfg.get("audio_ce_loss_weight") < 0:
+        raise ValueError("`audio_ce_loss_weight` must be non-negative.")
 
-    if (
-        hasattr(cfg, "lower_rejection_threshold")
-        and cfg.get("lower_rejection_threshold") is not None
-        and cfg.get("lower_rejection_threshold") > 1.0
-    ):
-        raise ValueError("Lower rejection threshold must be <= 1.0 or `None`.")
+    audio_kl_loss_weight = cfg.get("audio_kl_loss_weight", _DEFAULT_PARAMS.audio_kl_loss_weight)
+    audio_ce_loss_weight = cfg.get("audio_ce_loss_weight", _DEFAULT_PARAMS.audio_ce_loss_weight)
 
-    if (
-        hasattr(cfg, "upper_rejection_threshold")
-        and cfg.get("upper_rejection_threshold") is not None
-        and cfg.get("upper_rejection_threshold") < 1.0
-    ):
-        raise ValueError("Upper rejection threshold must be >= 1.0 or `None`.")
+    if audio_kl_loss_weight == 0.0 and audio_ce_loss_weight == 0.0:
+        raise ValueError("`audio_kl_loss_weight` and `audio_ce_loss_weight` cannot both be zero.")
 
-    if (
-        hasattr(cfg, "rejection_weight")
-        and cfg.get("rejection_weight") is not None
-        and cfg.get("rejection_weight") < 0
-    ):
-        raise ValueError(
-            "`rejection_weight` must be non-negative or `None`. "
-            "It defines the relative weighting for truncated samples in the loss."
-        )
+    if hasattr(cfg, "audio_nrmse_loss_weight") and cfg.get("audio_nrmse_loss_weight") < 0:
+        raise ValueError("`audio_nrmse_loss_weight` must be non-negative.")
+
+    lower_rejection_threshold = cfg.get("lower_rejection_threshold")
+
+    if lower_rejection_threshold is not None and not (0.0 <= lower_rejection_threshold <= 1.0):
+        raise ValueError("`lower_rejection_threshold` must be in the range [0, 1] or `None`.")
+
+    upper_rejection_threshold = cfg.get("upper_rejection_threshold")
+
+    if upper_rejection_threshold is not None and upper_rejection_threshold < 1.0:
+        raise ValueError("`upper_rejection_threshold` must be greater than or equal to 1.0 or `None`.")
+
+    rejection_weight = cfg.get("rejection_weight")
+
+    if rejection_weight is not None and not (0.0 <= rejection_weight <= 1.0):
+        raise ValueError("`rejection_weight` must be in the range [0, 1] or `None`.")
 
     if hasattr(cfg, "lt_loss_weight") and not (0.0 <= cfg.get("lt_loss_weight") <= 1.0):
         raise ValueError("`lt_loss_weight` must be in the range [0, 1].")
@@ -161,11 +156,8 @@ def _validate_configuration(cfg: DictConfig) -> None:
     if hasattr(cfg, "lt_distillation_ramp_len") and cfg.get("lt_distillation_ramp_len") < 0:
         raise ValueError("`lt_distillation_ramp_len` must be non-negative.")
 
-    if hasattr(cfg, "phonemes_loss_weight") and cfg.get("phonemes_loss_weight") < 0:
-        raise ValueError("`phonemes_loss_weight` must be non-negative.")
-
-    if hasattr(cfg, "phonemes_distillation_alpha") and not (0 <= cfg.get("phonemes_distillation_alpha") <= 1):
-        raise ValueError("`phonemes_distillation_alpha` must be in the range [0, 1].")
+    if hasattr(cfg, "phoneme_ce_loss_weight") and cfg.get("phoneme_ce_loss_weight") < 0:
+        raise ValueError("`phoneme_ce_loss_weight` must be non-negative.")
 
 
 def _get_teacher_model(cfg: DictConfig) -> EasyMagpieTTSModel:
@@ -206,6 +198,8 @@ class _StudentOutput:
     logits: Tensor
     logits_lt: Optional[Tensor]
     logits_phonemes: Optional[Tensor]
+    audio_codes_gt_lt: Optional[Tensor]
+    audio_codes_lens_gt_lt: Optional[Tensor]
 
 
 def _lt_sample_autoregressive(
@@ -269,13 +263,10 @@ def _lt_sample_autoregressive(
         next_local_transformer_input = model.local_transformer_in_projection(next_local_transformer_input)
         local_transformer_input = torch.cat([local_transformer_input, next_local_transformer_input], dim=1)
 
-    predicted_codes = torch.cat(predicted_codes, dim=1)
-    predicted_logits = torch.cat(predicted_logits, dim=1)
-    dims = (-1, model.frame_stacking_factor, model.num_audio_codebooks)
-    predicted_codes = predicted_codes.reshape(*dims).permute(0, 2, 1)
-
-    predicted_codes = predicted_codes[:bs]
-    predicted_logits = predicted_logits[:bs]
+    # EasyMagpie LT heads are already ordered as C*S independent stacked channels.
+    predicted_codes = torch.cat(predicted_codes, dim=1)[:bs]
+    predicted_codes = predicted_codes.view(bs, model.num_audio_codebooks, model.frame_stacking_factor)
+    predicted_logits = torch.cat(predicted_logits, dim=1)[:bs]
 
     return predicted_codes, predicted_logits
 
@@ -301,6 +292,7 @@ class _AudioCodesStep:
         self.codes_t_argmax = self.codes_t_argmax.view(batch_size, num_codebooks, fs_factor)
 
         if self.codes_t_lt is not None and self.codes_t_argmax_lt is not None and self.logits_t_lt is not None:
+            # EasyMagpie LT heads are already C*S independent stacked channels.
             self.codes_t_lt = self.codes_t_lt.view(batch_size, num_codebooks, fs_factor)
             self.codes_t_argmax_lt = self.codes_t_argmax_lt.view(batch_size, num_codebooks, fs_factor)
 
@@ -496,18 +488,22 @@ class _StreamingState:
         audio_codes: _AudioCodesStep,
         needs_audio: Tensor,
     ) -> None:
+        codes_t = audio_codes.codes_t.reshape(self.batch_size, -1)
+
         if self.last_audio_codes is None:
-            self.last_audio_codes = audio_codes.codes_t
+            self.last_audio_codes = codes_t
         else:
-            update_mask = needs_audio.view(self.batch_size, 1).expand_as(audio_codes.codes_t)
-            self.last_audio_codes = torch.where(update_mask, audio_codes.codes_t, self.last_audio_codes)
+            update_mask = needs_audio.view(self.batch_size, 1).expand_as(codes_t)
+            self.last_audio_codes = torch.where(update_mask, codes_t, self.last_audio_codes)
 
         if self.use_lt:
+            codes_t_lt = audio_codes.codes_t_lt.reshape(self.batch_size, -1)
+
             if self.last_audio_codes_lt is None:
-                self.last_audio_codes_lt = audio_codes.codes_t_lt
+                self.last_audio_codes_lt = codes_t_lt
             else:
-                update_mask = needs_audio.view(self.batch_size, 1).expand_as(audio_codes.codes_t_lt)
-                self.last_audio_codes_lt = torch.where(update_mask, audio_codes.codes_t_lt, self.last_audio_codes_lt)
+                update_mask = needs_audio.view(self.batch_size, 1).expand_as(codes_t_lt)
+                self.last_audio_codes_lt = torch.where(update_mask, codes_t_lt, self.last_audio_codes_lt)
 
     def update_audio_end_status(
         self,
@@ -639,14 +635,6 @@ class _TeacherPredictedCodes:
 
 
 @dataclass
-class _TeacherPredictedPhonemes:
-
-    tokens: Optional[Tensor]
-    logits: Optional[Tensor]
-    lens: Optional[Tensor]
-
-
-@dataclass
 class _TeacherOutput:
     """Outputs produced by the teacher rollout used as distillation targets."""
 
@@ -659,9 +647,46 @@ class _TeacherOutput:
     codes_lt: Optional[Tensor]
     logits_lt: Optional[Tensor]
 
-    tokens_phonemes: Optional[Tensor]
-    lens_phonemes: Optional[Tensor]
-    logits_phonemes: Optional[Tensor]
+
+def _validate_predicted_codes(
+    codes: Tensor,
+    pred_codes_lens: Tensor,
+    start_indices: Tensor,
+    end_indices: Tensor,
+    fs_factor: int,
+) -> None:
+    # If an item never entered audio generation, give it zero length by
+    # using its end position as its start position. Clamping -1 to zero
+    # would incorrectly assign predictions generated for other batch items to this item.
+    invalid_bounds = (start_indices < 0) | (end_indices < start_indices) | (end_indices > codes.size(-1))
+
+    if invalid_bounds.any():
+        invalid_items = torch.nonzero(invalid_bounds, as_tuple=False).flatten()
+        raise RuntimeError(
+            "Invalid teacher rollout boundaries: "
+            f"items={invalid_items.tolist()}, "
+            f"starts={start_indices[invalid_items].tolist()}, "
+            f"ends={end_indices[invalid_items].tolist()}, "
+            f"available_frames={codes.size(-1)}."
+        )
+
+    # All boundaries must align with complete stacked decoder steps because
+    # each stored logit position corresponds to one block of fs_factor unstacked codec frames.
+    unaligned_bounds = (
+        (start_indices % fs_factor != 0) | (end_indices % fs_factor != 0) | (pred_codes_lens % fs_factor != 0)
+    )
+    if unaligned_bounds.any():
+        invalid_items = torch.nonzero(unaligned_bounds, as_tuple=False).flatten()
+        raise RuntimeError(
+            "Teacher rollout boundaries are not aligned with the audio "
+            f"items={invalid_items.tolist()}, "
+            f"starts={start_indices[invalid_items].tolist()}, "
+            f"ends={end_indices[invalid_items].tolist()}, "
+            f"lengths={pred_codes_lens[invalid_items].tolist()}."
+        )
+
+    if pred_codes_lens.max().item() == 0:
+        raise RuntimeError("Teacher rollout produced no audio predictions.")
 
 
 class _TeacherInferenceEngine:
@@ -1039,7 +1064,6 @@ class _TeacherInferenceEngine:
 
         codes_t = self.model.sample_codes_from_logits(logits_t, temperature=temp, topk=topk)
         codes_t_argmax = codes_t if temp <= 0.0 else self.model.sample_codes_from_logits(logits_t, temperature=0.01)
-
         codes_t_lt, codes_t_argmax_lt, logits_t_lt = None, None, None
 
         if use_lt:
@@ -1052,7 +1076,7 @@ class _TeacherInferenceEngine:
                 use_kv_cache=True,
                 sanitize_logits=True,
             )
-            codes_t_lt = codes_t_lt.permute(0, 2, 1).reshape(bs, -1)
+            codes_t_lt = codes_t_lt.reshape(bs, -1)
             # As in the pre-training stage, we do not use greedy sampling for LT.
             codes_t_argmax_lt = codes_t_lt
 
@@ -1076,6 +1100,8 @@ class _TeacherInferenceEngine:
             state.update_phoneme_start_idx(status.phoneme)
             phoneme_tokens = self._predict_phoneme_tokens(state)
 
+            # Retain predicted phoneme tokens/logits for rollout debugging.
+            # They are not used by the regular ground-truth phoneme training loss.
             state.update_phoneme_step(
                 tokens=phoneme_tokens,
                 fs_factor=self.phoneme_stacking_factor,
@@ -1091,14 +1117,14 @@ class _TeacherInferenceEngine:
             state.update_audio_start_idx(status.audio)
             audio_codes = self._predict_audio_codes(state, use_lt=state.use_lt)
 
-            state.update_last_audio_codes(
-                audio_codes=audio_codes,
-                needs_audio=status.audio,
-            )
             audio_codes.unstack(
                 batch_size=state.batch_size,
                 num_codebooks=self.num_audio_codebooks,
                 fs_factor=self.audio_stacking_factor,
+            )
+            state.update_last_audio_codes(
+                audio_codes=audio_codes,
+                needs_audio=status.audio,
             )
             newly_ended_items = state.update_audio_end_status(
                 audio_codes=audio_codes,
@@ -1148,6 +1174,7 @@ class _TeacherInferenceEngine:
         bs = state.batch_size
         device = state.device
         use_lt = state.use_lt
+        fs_factor = self.audio_stacking_factor
 
         if len(state.pred_codes) == 0:
             raise RuntimeError("Teacher rollout produced no audio predictions.")
@@ -1158,22 +1185,30 @@ class _TeacherInferenceEngine:
             codes = torch.cat(state.pred_codes, dim=-1)
             logits = torch.cat(state.pred_codes_logits, dim=1)
 
+            codes_lt, logits_lt = None, None
+
             if use_lt:
                 codes_lt = torch.cat(state.pred_codes_lt, dim=-1)
                 logits_lt = torch.cat(state.pred_codes_logits_lt, dim=1)
 
-            start_indices = torch.clamp(state.audio_prediction_start_idx, min=0)
+            raw_start_indices = state.audio_prediction_start_idx
             end_indices = torch.where(
                 condition=state.audio_prediction_end_idx >= 0,
                 input=state.audio_prediction_end_idx,
                 other=torch.full_like(state.audio_prediction_end_idx, codes.size(-1)),
             )
+
+            never_started = raw_start_indices < 0
+            start_indices = torch.where(
+                condition=never_started,
+                input=end_indices,
+                other=raw_start_indices,
+            )
             pred_codes_lens = end_indices - start_indices
+
+            _validate_predicted_codes(codes, pred_codes_lens, start_indices, end_indices, fs_factor)
+
             max_len = pred_codes_lens.max().item()
-
-            if max_len == 0:
-                raise RuntimeError("Teacher rollout produced no audio predictions.")
-
             max_stacked_len = max_len // self.audio_stacking_factor
             codes_size = (bs, self.num_audio_codebooks, max_len)
             logits_dim = self.num_audio_codebooks * self.num_audio_tokens_per_codebook * self.audio_stacking_factor
@@ -1208,33 +1243,6 @@ class _TeacherInferenceEngine:
             logits_lt=pred_logits_lt,
         )
 
-    def _finalize_predicted_phonemes(
-        self,
-        state: _StreamingState,
-        return_phoneme_outputs: bool,
-    ) -> _TeacherPredictedPhonemes:
-        tokens, logits, lens = None, None, None
-
-        if return_phoneme_outputs and self.model.phoneme_tokenizer is not None and state.current_phoneme_step_idx > 0:
-            tokens = torch.cat(state.pred_phoneme_tokens, dim=-1)
-            logits = torch.cat(state.pred_phoneme_logits, dim=1)
-
-            phoneme_start = torch.clamp(state.phoneme_prediction_start_idx, min=0)
-
-            phoneme_end = torch.where(
-                condition=state.phoneme_prediction_end_idx >= 0,
-                input=state.phoneme_prediction_end_idx,
-                other=torch.full_like(state.phoneme_prediction_end_idx, tokens.size(-1)),
-            )
-            lens = phoneme_end - phoneme_start
-
-            max_len = lens.max().item()
-            max_stacked_len = (max_len + self.phoneme_stacking_factor - 1) // self.phoneme_stacking_factor
-            tokens = tokens[:, :, :max_len]
-            logits = logits[:, :max_stacked_len, :]
-
-        return _TeacherPredictedPhonemes(tokens=tokens, logits=logits, lens=lens)
-
     def _apply_rollout_upper_bound_rejection(
         self,
         state: _StreamingState,
@@ -1250,14 +1258,27 @@ class _TeacherInferenceEngine:
         if len(state.pred_codes) == 0:
             return state
 
-        current_frame_count = len(state.pred_codes) * self.audio_stacking_factor
+        # Indices in pred_codes use the global rollout-frame coordinate system.
+        current_frame_count = state.current_frame_idx
         upper_thresholds = torch.round(upper_rejection_threshold * gt_audio_lens).long().to(state.device)
-        should_reject = ~state.finished & (current_frame_count >= upper_thresholds)
+
+        # Compare the threshold with the number of frames generated for each item,
+        # not with the global rollout position. Items may start audio generation at
+        # different global positions because their context lengths differ.
+        has_started = state.audio_prediction_start_idx >= 0
+        start_indices = state.audio_prediction_start_idx.clamp_min(0)
+        generated_lens = current_frame_count - start_indices
+
+        should_reject = has_started & (~state.finished) & (generated_lens >= upper_thresholds)
 
         if not should_reject.any():
             return state
 
         state.finished = state.finished | should_reject
+
+        if state.rejected is None:
+            state.rejected = torch.zeros_like(state.finished)
+
         state.rejected = state.rejected | should_reject
         newly_rejected = should_reject & (state.audio_prediction_end_idx == -1)
 
@@ -1268,21 +1289,89 @@ class _TeacherInferenceEngine:
                 other=state.audio_prediction_end_idx,
             )
 
-        if rejection_weight is not None and state.sample_weights is not None:
+        if rejection_weight is not None:
+            if state.sample_weights is None:
+                state.sample_weights = torch.ones(
+                    state.batch_size,
+                    dtype=torch.float,
+                    device=state.device,
+                )
             state.sample_weights = torch.where(
                 condition=should_reject,
                 input=torch.full_like(state.sample_weights, rejection_weight),
                 other=state.sample_weights,
             )
 
+        dataset_names = batch.get("dataset_names")
+
         for item_idx in torch.nonzero(should_reject, as_tuple=False).flatten().tolist():
-            dataset_names = batch.get("dataset_names")
             dataset_name = dataset_names[item_idx] if dataset_names is not None else "Unknown"
             logging.info(
                 f"Item {item_idx} rejected by upper length bound at generation step "
                 f"{len(state.pred_codes)} (current length: {current_frame_count}, "
                 f"dataset: {dataset_name})."
             )
+        return state
+
+    def _apply_max_steps_rejection(
+        self,
+        state: _StreamingState,
+        batch: dict[str, Tensor],
+        rejection_weight: Optional[float],
+    ) -> _StreamingState:
+        should_reject = ~state.finished
+
+        if not should_reject.any():
+            return state
+
+        current_frame_count = state.current_frame_idx
+        has_started = state.audio_prediction_start_idx >= 0
+        never_started = should_reject & (~has_started)
+
+        # A never-started item must have zero finalized length. Using the current
+        # position as both start and end prevents it from inheriting predictions
+        # generated for other batch items.
+        state.audio_prediction_start_idx = torch.where(
+            condition=never_started,
+            input=torch.full_like(state.audio_prediction_start_idx, current_frame_count),
+            other=state.audio_prediction_start_idx,
+        )
+        state.audio_prediction_end_idx = torch.where(
+            condition=should_reject & (state.audio_prediction_end_idx == -1),
+            input=torch.full_like(state.audio_prediction_end_idx, current_frame_count),
+            other=state.audio_prediction_end_idx,
+        )
+        state.finished = state.finished | should_reject
+
+        if state.rejected is None:
+            state.rejected = torch.zeros_like(state.finished)
+
+        state.rejected = state.rejected | should_reject
+
+        if rejection_weight is not None:
+            if state.sample_weights is None:
+                state.sample_weights = torch.ones(
+                    state.batch_size,
+                    dtype=torch.float,
+                    device=state.device,
+                )
+            state.sample_weights = torch.where(
+                condition=should_reject,
+                input=torch.full_like(state.sample_weights, rejection_weight),
+                other=state.sample_weights,
+            )
+
+        dataset_names = batch.get("dataset_names")
+
+        for item_idx in torch.nonzero(should_reject, as_tuple=False).flatten().tolist():
+            dataset_name = dataset_names[item_idx] if dataset_names is not None else "Unknown"
+            logging.info(
+                f"Item {item_idx} rejected after reaching max_decoder_steps, "
+                f"(global frame position: {current_frame_count}, "
+                f"audio generation started: {bool(has_started[item_idx].item())}, "
+                f"dataset: {dataset_name})."
+            )
+
         return state
 
     def _apply_final_lower_bound_rejection(
@@ -1344,7 +1433,6 @@ class _TeacherInferenceEngine:
         self,
         batch: dict[str, Tensor],
         use_lt: bool,
-        return_phoneme_outputs: bool,
         max_decoder_steps: int = 500,
         temperature: float = 0.7,
         topk: int = 80,
@@ -1405,8 +1493,14 @@ class _TeacherInferenceEngine:
                         state, batch, upper_rejection_threshold, rejection_weight
                     )
 
+            if use_rollout_rejection and not state.finished.all():
+                state = self._apply_max_steps_rejection(
+                    state=state,
+                    batch=batch,
+                    rejection_weight=rejection_weight,
+                )
+
             teacher_codes = self._finalize_predicted_codes(state)
-            teacher_phonemes = self._finalize_predicted_phonemes(state, return_phoneme_outputs)
 
             if teacher_codes.codes_lt is not None and teacher_codes.codes.size(-1) != teacher_codes.codes_lt.size(-1):
                 raise RuntimeError(
@@ -1421,9 +1515,6 @@ class _TeacherInferenceEngine:
                 sample_weights=state.sample_weights,
                 codes_lt=teacher_codes.codes_lt,
                 logits_lt=teacher_codes.logits_lt,
-                tokens_phonemes=teacher_phonemes.tokens,
-                logits_phonemes=teacher_phonemes.logits,
-                lens_phonemes=teacher_phonemes.lens,
                 rejected=state.rejected.clone() if use_rollout_rejection else None,
             )
             if lower_rejection_threshold is not None:
@@ -1554,7 +1645,6 @@ _MONITORED_KEYS_TRAIN: list[str] = [
     _get_loss_key(key=_LossKey.ce_loss, mode=_LossMode.local_transformer),
     _get_loss_key(key=_LossKey.nrmse_loss, mode=_LossMode.local_transformer),
     _get_loss_key(key=_LossKey.loss, mode=_LossMode.phoneme),
-    _get_loss_key(key=_LossKey.kl_loss, mode=_LossMode.phoneme),
     _get_loss_key(key=_LossKey.ce_loss, mode=_LossMode.phoneme),
     _MetricKey.rejection_rate.value,
 ]
@@ -1619,6 +1709,7 @@ class _PreparedStudentInput:
     audio_codes_lens_gt: Tensor
     phoneme_tokens_lens_stacked: Optional[Tensor] = None
     audio_codes_gt_lt: Optional[Tensor] = None
+    audio_codes_lens_gt_lt: Optional[Tensor] = None
 
 
 @dataclass
@@ -2020,67 +2111,6 @@ def _compute_validation_metrics(
     return output
 
 
-def _rescale_logits(
-    teacher_output: _TeacherOutput,
-    student_output: _StudentOutput,
-    use_lt: bool,
-    use_phonemes: bool,
-    temperature: float,
-) -> tuple[_TeacherOutput, _StudentOutput]:
-    if temperature == 1.0:
-        return teacher_output, student_output
-
-    student_output.logits = student_output.logits / temperature
-    teacher_output.logits = teacher_output.logits / temperature
-
-    if use_lt:
-        student_output.logits_lt = student_output.logits_lt / temperature
-        teacher_output.logits_lt = teacher_output.logits_lt / temperature
-
-    if use_phonemes:
-        student_output.logits_phonemes = student_output.logits_phonemes / temperature
-        teacher_output.logits_phonemes = teacher_output.logits_phonemes / temperature
-
-    return teacher_output, student_output
-
-
-def _crop_phonemes(
-    batch: dict[str, Tensor | list],
-    teacher_output: _TeacherOutput,
-    student_output: _StudentOutput,
-    stacking_factor: int,
-) -> tuple[_TeacherOutput, _StudentOutput]:
-    if student_output.logits_phonemes is None:
-        raise ValueError(
-            "Expected `student_output.logits_phonemes` to be available when phoneme-channel "
-            "distillation or supervision is enabled."
-        )
-    if teacher_output.tokens_phonemes is None or teacher_output.logits_phonemes is None:
-        raise ValueError(
-            "Expected `teacher_output.tokens_phonemes` and `teacher_output.logits_phonemes` "
-            "to be available when phoneme-channel distillation is enabled."
-        )
-    if teacher_output.lens_phonemes is None:
-        raise ValueError(
-            "Expected `teacher_output.lens_phonemes` to be available when phoneme-channel " "distillation is enabled."
-        )
-    effective_phoneme_lens = torch.minimum(teacher_output.lens_phonemes, batch["phoneme_tokens_lens"] - 1)
-    max_len = effective_phoneme_lens.max().item()
-    max_stacked_len = (max_len + stacking_factor - 1) // stacking_factor
-
-    if student_output.logits_phonemes.size(1) < max_stacked_len:
-        raise ValueError(
-            f"Student phoneme logits are shorter than required after cropping: "
-            f"{student_output.logits_phonemes.size(1)} < {max_stacked_len}."
-        )
-    student_output.logits_phonemes = student_output.logits_phonemes[:, :max_stacked_len, :]
-    teacher_output.tokens_phonemes = teacher_output.tokens_phonemes[:, :, :max_len]
-    teacher_output.logits_phonemes = teacher_output.logits_phonemes[:, :max_stacked_len, :]
-    teacher_output.lens_phonemes = effective_phoneme_lens
-
-    return teacher_output, student_output
-
-
 def _compute_rejection_rate(
     teacher_output: _TeacherOutput,
 ) -> Tensor:
@@ -2131,10 +2161,6 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
         self.rejection_debug_meta_path: Optional[Path] = None
         self.rejection_debug_meta_fp: Optional[TextIOWrapper] = None
         self.debug_meta_flush_interval_steps: int = 1
-
-    @property
-    def distill_phonemes(self) -> bool:
-        return self.distill_phoneme_channel and self.phonemes_loss_weight
 
     @property
     def use_rollout_rejection(self) -> bool:
@@ -2203,36 +2229,56 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
         for k, v in defaults.items():
             setattr(self, k, self.cfg.get(k, v))
 
+    @property
+    def num_lt_codebooks(self) -> int:
+        return self.num_audio_codebooks * self.frame_stacking_factor
+
     def _init_losses(self) -> None:
-        if self.audio_alpha != 1.0:
+        if self.audio_kl_loss_weight > 0.0:
             self._codes_kl_criterion = KLDivergenceLoss(
                 num_codebooks=self.num_audio_codebooks,
                 num_tokens_per_codebook=self.num_all_tokens_per_codebook,
                 frame_stacking_factor=self.frame_stacking_factor,
+                codebook_ordering="codebook-major",
             )
-        if self.audio_alpha != 0.0:
+            self._lt_codes_kl_criterion = KLDivergenceLoss(
+                num_codebooks=self.num_lt_codebooks,
+                num_tokens_per_codebook=self.num_all_tokens_per_codebook,
+                frame_stacking_factor=1,
+                codebook_ordering="codebook-major",
+            )
+        if self.audio_ce_loss_weight > 0.0:
             self._codes_ce_criterion = CodesCrossEntropyLoss(
                 num_codebooks=self.num_audio_codebooks,
                 num_tokens_per_codebook=self.num_all_tokens_per_codebook,
                 frame_stacking_factor=self.frame_stacking_factor,
+                codebook_ordering="codebook-major",
             )
-        if self.audio_beta != 0.0:
+            self._lt_codes_ce_criterion = CodesCrossEntropyLoss(
+                num_codebooks=self.num_lt_codebooks,
+                num_tokens_per_codebook=self.num_all_tokens_per_codebook,
+                frame_stacking_factor=1,
+                codebook_ordering="codebook-major",
+            )
+        if self.audio_nrmse_loss_weight > 0.0:
             self._codes_nrmse_criterion = NRMSELogitsLoss(
                 num_codebooks=self.num_audio_codebooks,
                 num_tokens_per_codebook=self.num_all_tokens_per_codebook,
                 frame_stacking_factor=self.frame_stacking_factor,
+                codebook_ordering="codebook-major",
             )
-        if self.distill_phoneme_channel and self.phonemes_loss_weight and self.phonemes_distillation_alpha != 1.0:
-            self._phonemes_kl_criterion = KLDivergenceLoss(
-                num_codebooks=1,
-                num_tokens_per_codebook=self.phoneme_vocab_size,
-                frame_stacking_factor=self.phoneme_stacking_factor,
+            self._lt_codes_nrmse_criterion = NRMSELogitsLoss(
+                num_codebooks=self.num_lt_codebooks,
+                num_tokens_per_codebook=self.num_all_tokens_per_codebook,
+                frame_stacking_factor=1,
+                codebook_ordering="codebook-major",
             )
-        if self.phonemes_loss_weight and self.phonemes_distillation_alpha != 0.0:
+        if self.phoneme_ce_loss_weight:
             self._phonemes_ce_criterion = CodesCrossEntropyLoss(
                 num_codebooks=1,
                 num_tokens_per_codebook=self.phoneme_vocab_size,
                 frame_stacking_factor=self.phoneme_stacking_factor,
+                codebook_ordering="codebook-major",
             )
 
     def _get_audio_log_dir(self) -> Path:
@@ -2490,11 +2536,12 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
             batch_combined.phoneme_tokens_lens_stacked = batch_phonemes.tokens_lens_stacked
 
         if use_lt:
-            _, audio_codes_gt_lt, _ = self._process_audio_input(
+            _, audio_codes_gt_lt, audio_codes_lens_gt_lt = self._process_audio_input(
                 audio_codes=batch["audio_codes_lt_teacher"],
                 audio_codes_lens=batch["audio_codes_lens_teacher"],
             )
             batch_combined.audio_codes_gt_lt = audio_codes_gt_lt
+            batch_combined.audio_codes_lens_gt_lt = audio_codes_lens_gt_lt
 
         return batch_combined, batch_delays
 
@@ -2544,6 +2591,8 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
             logits=logits,
             logits_lt=logits_lt,
             logits_phonemes=logits_phonemes,
+            audio_codes_gt_lt=batch_combined.audio_codes_gt_lt,
+            audio_codes_lens_gt_lt=batch_combined.audio_codes_lens_gt_lt,
         )
 
     def _update_batch(
@@ -2568,7 +2617,7 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
         if self.local_transformer_type == LocalTransformerType.NO_LT or not self.distill_local_transformer:
             return False
 
-        return self.global_step >= self.lt_distillation_start_step
+        return self.lt_loss_weight > 0.0 and self.global_step >= self.lt_distillation_start_step
 
     def _get_local_transformer_loss_weight(self) -> float:
         if self.global_step < self.lt_distillation_start_step:
@@ -2582,6 +2631,15 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
 
         return weight
 
+    def _get_kl_criterion(self, mode: _LossMode) -> Callable:
+        return self._lt_codes_kl_criterion if mode == _LossMode.local_transformer else self._codes_kl_criterion
+
+    def _get_ce_criterion(self, mode: _LossMode) -> Callable:
+        return self._lt_codes_ce_criterion if mode == _LossMode.local_transformer else self._codes_ce_criterion
+
+    def _get_nrmse_criterion(self, mode: _LossMode) -> Callable:
+        return self._lt_codes_nrmse_criterion if mode == _LossMode.local_transformer else self._codes_nrmse_criterion
+
     def _compute_codes_loss_helper(
         self,
         teacher_logits: Tensor,
@@ -2593,20 +2651,25 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
     ) -> dict[str, Tensor]:
         output: dict[str, Tensor] = {}
 
-        if self.audio_alpha != 1.0:
-            kl_loss = self._codes_kl_criterion(
-                student_logits=student_logits,
-                teacher_logits=teacher_logits,
+        if self.audio_kl_loss_weight > 0.0:
+            temperature = self.distillation_temperature
+
+            # Temperature is applied only to the soft KL distributions.
+            student_logits_kl = student_logits / temperature
+            teacher_logits_kl = teacher_logits / temperature
+
+            kl_loss = self._get_kl_criterion(mode)(
+                student_logits=student_logits_kl,
+                teacher_logits=teacher_logits_kl,
                 mask=mask,
                 sample_weights=sample_weights,
             )
-            if self.distillation_temperature != 1.0:
-                kl_loss = kl_loss * (self.distillation_temperature**2)
+            kl_loss = kl_loss * (temperature**2)
 
             output[_get_loss_key(_LossKey.kl_loss, mode)] = kl_loss
 
-        if self.audio_alpha != 0.0:
-            ce_loss = self._codes_ce_criterion(
+        if self.audio_ce_loss_weight > 0.0:
+            ce_loss = self._get_ce_criterion(mode)(
                 predicted_logits=student_logits,
                 target_codes=teacher_codes,
                 mask=mask,
@@ -2616,57 +2679,17 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
 
         kl_term = output.get(_get_loss_key(_LossKey.kl_loss, mode), 0.0)
         ce_term = output.get(_get_loss_key(_LossKey.ce_loss, mode), 0.0)
-        loss = (1 - self.audio_alpha) * kl_term + self.audio_alpha * ce_term
+        loss = self.audio_kl_loss_weight * kl_term + self.audio_ce_loss_weight * ce_term
 
-        if self.audio_beta > 0.0:
-            nrmse_loss = self._codes_nrmse_criterion(
+        if self.audio_nrmse_loss_weight > 0.0:
+            nrmse_loss = self._get_nrmse_criterion(mode)(
                 student_logits=student_logits,
                 teacher_logits=teacher_logits,
                 mask=mask,
                 sample_weights=sample_weights,
             )
             output[_get_loss_key(_LossKey.nrmse_loss, mode)] = nrmse_loss
-            loss = loss + self.audio_beta * nrmse_loss
-
-        output[_get_loss_key(_LossKey.loss, mode)] = loss
-
-        return output
-
-    def _compute_phoneme_loss_distillation(
-        self,
-        teacher_logits: Tensor,
-        teacher_codes: Tensor,
-        student_logits: Tensor,
-        mask: Tensor,
-        sample_weights: Optional[Tensor],
-    ) -> dict[str, Tensor]:
-        output: dict[str, Tensor] = {}
-        mode = _LossMode.phoneme
-
-        if self.phonemes_distillation_alpha != 1.0:
-            kl_loss = self._phonemes_kl_criterion(
-                student_logits=student_logits,
-                teacher_logits=teacher_logits,
-                mask=mask,
-                sample_weights=sample_weights,
-            )
-            if self.distillation_temperature != 1.0:
-                kl_loss = kl_loss * (self.distillation_temperature**2)
-
-            output[_get_loss_key(_LossKey.kl_loss, mode)] = kl_loss
-
-        if self.phonemes_distillation_alpha != 0.0:
-            ce_loss = self._phonemes_ce_criterion(
-                predicted_logits=student_logits,
-                target_codes=teacher_codes,
-                mask=mask,
-                sample_weights=sample_weights,
-            )
-            output[_get_loss_key(_LossKey.ce_loss, mode)] = ce_loss
-
-        kl_term = output.get(_get_loss_key(_LossKey.kl_loss, mode), 0.0)
-        ce_term = output.get(_get_loss_key(_LossKey.ce_loss, mode), 0.0)
-        loss = (1 - self.phonemes_distillation_alpha) * kl_term + self.phonemes_distillation_alpha * ce_term
+            loss = loss + self.audio_nrmse_loss_weight * nrmse_loss
 
         output[_get_loss_key(_LossKey.loss, mode)] = loss
 
@@ -2688,7 +2711,30 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
             # Remove BOS.
             target_tokens = target_tokens.long()[:, 1:].unsqueeze(1)
             tokens_lens = tokens_lens - 1
-            mask = get_mask_from_lengths(tokens_lens)
+
+            # `student_logits` is stacked-time: (B, ceil(T / S), S * V).
+            # The shared CE criterion expects an unstacked target/mask whose
+            # width is exactly T_stacked * S.
+            expected_unstacked_len = student_logits.size(1) * self.phoneme_stacking_factor
+
+            if tokens_lens.max().item() > expected_unstacked_len:
+                raise RuntimeError(
+                    "Phoneme target length exceeds the time coverage of phoneme logits: "
+                    f"max_target_len={tokens_lens.max().item()}, "
+                    f"logit_coverage={expected_unstacked_len}."
+                )
+
+            target_tokens = target_tokens[:, :, :expected_unstacked_len]
+            pad_len = expected_unstacked_len - target_tokens.size(-1)
+
+            if pad_len > 0:
+                target_tokens = torch.nn.functional.pad(
+                    target_tokens,
+                    pad=(0, pad_len),
+                    value=self.phoneme_tokenizer.eos_token_id,
+                )
+
+            mask = get_mask_from_lengths(tokens_lens, x=target_tokens)
 
             loss = self._phonemes_ce_criterion(
                 predicted_logits=student_logits,
@@ -2723,11 +2769,13 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
         output["loss"] = output[backbone_loss_key]
 
         if use_lt:
+            lt_codes_mask = get_mask_from_lengths(student_output.audio_codes_lens_gt_lt)
+
             lt_output = self._compute_codes_loss_helper(
                 teacher_logits=teacher_output.logits_lt,
-                teacher_codes=teacher_output.codes_lt,
+                teacher_codes=student_output.audio_codes_gt_lt,
                 student_logits=student_output.logits_lt,
-                mask=codes_mask,
+                mask=lt_codes_mask,
                 sample_weights=teacher_output.sample_weights,
                 mode=_LossMode.local_transformer,
             )
@@ -2737,24 +2785,15 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
             output["loss"] = (1 - lt_weight) * output["loss"] + lt_weight * output[lt_loss_key]
             del output[lt_loss_key]
 
-        if self.phonemes_loss_weight and student_output.logits_phonemes is not None:
-            if self.distill_phoneme_channel:
-                phonemes_output = self._compute_phoneme_loss_distillation(
-                    teacher_logits=teacher_output.logits_phonemes,
-                    teacher_codes=teacher_output.tokens_phonemes,
-                    student_logits=student_output.logits_phonemes,
-                    mask=get_mask_from_lengths(teacher_output.lens_phonemes),
-                    sample_weights=teacher_output.sample_weights,
-                )
-            else:
-                phonemes_output = self._compute_phoneme_loss_guidance(
-                    batch=batch,
-                    student_logits=student_output.logits_phonemes,
-                    sample_weights=teacher_output.sample_weights,
-                )
+        if self.phoneme_ce_loss_weight and student_output.logits_phonemes is not None:
+            phonemes_output = self._compute_phoneme_loss_guidance(
+                batch=batch,
+                student_logits=student_output.logits_phonemes,
+                sample_weights=teacher_output.sample_weights,
+            )
             output.update(phonemes_output)
             phoneme_loss_key = _get_loss_key(key=_LossKey.loss, mode=_LossMode.phoneme)
-            output["loss"] = output["loss"] + self.phonemes_loss_weight * output[phoneme_loss_key]
+            output["loss"] = output["loss"] + self.phoneme_ce_loss_weight * output[phoneme_loss_key]
 
         return output
 
@@ -2790,6 +2829,7 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
             raise ValueError()
 
         rejected_indices = torch.nonzero(teacher_output.rejected, as_tuple=False).flatten().tolist()
+        # rejected_indices = [i for i in range(teacher_output.rejected.size(0))]
 
         if not rejected_indices:
             return
@@ -2869,7 +2909,6 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
         teacher_output = self._teacher_inference_engine.infer_batch(
             batch=batch,
             use_lt=use_lt,
-            return_phoneme_outputs=self.distill_phoneme_channel,
             max_decoder_steps=self.max_decoder_steps,
             temperature=self.rollout_temperature,
             topk=self.rollout_topk,
@@ -2886,21 +2925,6 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
 
         batch = self._update_batch(batch, teacher_output, use_lt)
         student_output = self._process_batch(batch, use_lt, mode)
-
-        teacher_output, student_output = _rescale_logits(
-            teacher_output=teacher_output,
-            student_output=student_output,
-            use_lt=use_lt,
-            use_phonemes=self.distill_phonemes,
-            temperature=self.distillation_temperature,
-        )
-        if self.distill_phonemes:
-            teacher_output, student_output = _crop_phonemes(
-                batch=batch,
-                teacher_output=teacher_output,
-                student_output=student_output,
-                stacking_factor=self.phoneme_stacking_factor,
-            )
         output = self._compute_loss(batch, teacher_output, student_output, use_lt)
 
         if mode == "train" and self.use_rollout_rejection:
